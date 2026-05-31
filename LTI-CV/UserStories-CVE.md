@@ -679,7 +679,7 @@ Elegí WSJF porque obliga a considerar simultáneamente el valor que entrega una
 
 - US-07 no puede iniciarse sin US-05: el recordatorio genera un nuevo `MagicLink` del mismo tipo que el original.
 - US-00 no tiene dependencias: es la historia raíz del sistema.
-- US-01a depende de US-00: la Application requiere `organization_id` del tenant extraído del JWT.
+- US-01a depende de US-00: la Application obtiene `organization_id` resuelto server-side desde el `job_id` en el endpoint público (TICKET-03); `organization_id` nunca viaja en el body ni se extrae del JWT en este flujo.
 - US-05 depende de US-00: el `MagicLink.user_id` referencia un `User` con `role = "hiring_manager"`.
 - US-09a depende de US-01a: el parser opera sobre `cv_url` almacenado al crear la Application.
 - US-03 depende de US-01a: el portal requiere una Application existente con `portal_token`.
@@ -761,13 +761,13 @@ Antes de iniciar el desarrollo del formulario, el equipo necesita respuestas con
 
 3. **Mecanismo de identificación del borrador:** si el candidato no tiene cuenta, ¿cómo se vincula el borrador guardado en DB con el candidato al retomar? ¿Cookie de sesión, token en URL, email como identificador? La respuesta determina el diseño del endpoint de auto-save y la query de recuperación.
 
-4. **Email de reanudación:** el escenario 2 de US-01a menciona "enlace de reanudación enviado por email". US-04 (notificaciones) está en Sprint 2. ¿El envío de este email es parte de US-01a o una dependencia de US-04? Si es parte de US-01a, necesita un template mínimo.
+4. **Email de reanudación:** el escenario 2 de US-01a describe retoma desde el mismo navegador dentro de 7 días mediante cookie o token local; no incluye envío de email. El email de reanudación **no es parte del alcance de US-01a**; las notificaciones por email corresponden a US-04 (Sprint 2). No se requiere template de email en Sprint 1.
 
 **Criterios de Aceptación:**
 - El equipo de producto entrega la lista completa de campos (nombre, tipo, obligatorio/opcional) antes del día 2 del Sprint 1.
 - Se define el comportamiento de layout para viewport 768px–1024px.
 - Se define el mecanismo de identificación de borradores para candidatos anónimos.
-- Se define si el email de reanudación es parte del alcance de US-01a o de US-04.
+- Confirmado: el email de reanudación pertenece a US-04 (Sprint 2) y queda fuera del alcance de US-01a.
 
 **Prioridad:** Crítica — bloquea TICKET-02, TICKET-03 y TICKET-04
 
@@ -867,8 +867,11 @@ Comportamiento requerido según el PRD (sección 12, módulo Pipeline):
 **Descripción:**
 Implementar el endpoint que recibe actualizaciones parciales del formulario en progreso y persiste el estado del borrador en `applications`. Este endpoint es llamado automáticamente por el frontend cada 30 segundos mientras el candidato tiene el formulario abierto.
 
+**Flujo de obtención del `application_id`:** al abrir el formulario por primera vez, el frontend llama a `POST /jobs/:jobId/applications` con `stage="draft"` y sin `gdpr_consent` aún (o bien a un endpoint dedicado `POST /applications/draft` si se decide separarlo — pendiente de decisión en TICKET-01). Este POST inicial retorna el `application_id` que el frontend almacena en memoria para usar en todos los PATCH subsiguientes. Sin este `application_id`, el primer auto-save no puede ejecutarse. El endpoint TICKET-03 ya retorna `application_id` en su respuesta HTTP 201; si se reutiliza para la creación del draft inicial, debe asegurarse que no exija `gdpr_consent` en ese momento o que se use un endpoint separado.
+
 Comportamiento requerido:
 - Solo opera sobre Applications en estado `stage = "draft"`. Si el estado es otro, retorna HTTP 409.
+- Si el borrador tiene `updated_at < NOW() - 7 days` (borrador expirado según la misma regla definida en TICKET-05), retorna HTTP 409 con `{"error": {"code": "DRAFT_EXPIRED"}}` sin modificar ningún dato.
 - Actualiza los campos del formulario enviados en el body (parcial, no reemplaza todo el registro).
 - Actualiza `updated_at`.
 - No registra en `AuditLog` (operación de alta frecuencia; registrar cada auto-save generaría ruido).
@@ -878,6 +881,7 @@ Comportamiento requerido:
 **Criterios de Aceptación:**
 - `PATCH` sobre una Application en estado `draft` actualiza los campos enviados y retorna HTTP 200 en menos de 200ms.
 - `PATCH` sobre una Application en estado distinto de `draft` retorna HTTP 409.
+- `PATCH` sobre un borrador con `updated_at` de más de 7 días retorna HTTP 409 con `{"error": {"code": "DRAFT_EXPIRED"}}`. Verificable con test de integración usando un registro con `updated_at = NOW() - 8 days`.
 - Campos no enviados en el body no son modificados (update parcial, no reemplazo).
 - El campo `updated_at` refleja el timestamp del último auto-save. Verificable con query directa a DB en test de integración.
 - El endpoint no genera entradas en `AuditLog`. Verificable con count de `audit_logs` antes y después del PATCH.
@@ -890,7 +894,7 @@ Comportamiento requerido:
 
 **Etiquetas:** `backend` `api` `auto-save` `us-01a` `sprint-1`
 
-**Comentarios:** La frecuencia de 30 segundos es responsabilidad del frontend (TICKET-06). Este endpoint solo debe ser eficiente y seguro. Discutir con TICKET-01 el mecanismo de autenticación del candidato anónimo antes de implementar.
+**Comentarios:** La frecuencia de 30 segundos es responsabilidad del frontend (TICKET-08). Este endpoint solo debe ser eficiente y seguro. Discutir con TICKET-01 el mecanismo de autenticación del candidato anónimo antes de implementar.
 
 **Dependencias:** TICKET-02 (schema), TICKET-01 (mecanismo de identificación del borrador)
 
@@ -1104,7 +1108,7 @@ Diseñar e implementar la suite de tests que cubre los tres escenarios de acepta
 - `POST /jobs/:jobId/applications` sin `gdpr_consent` → HTTP 422 `GDPR_CONSENT_REQUIRED`
 - `POST /jobs/:jobId/applications` con par `candidate_id + job_id` duplicado → HTTP 422 `DUPLICATE_APPLICATION`
 - `POST /jobs/:jobId/applications` válido → HTTP 201 con `portal_token` de 64+ caracteres
-- `PATCH /applications/:id` sobre borrador expirado → HTTP 409
+- `PATCH /applications/:id` sobre borrador expirado (> 7 días) → HTTP 409 `DRAFT_EXPIRED`
 - `GET /applications/draft?token=` con borrador de 8 días → HTTP 410 con `cv_url` preservado
 - Intento de acceso con `organization_id` de otro tenant → HTTP 403 o HTTP 404
 
@@ -1157,7 +1161,7 @@ Diseñar e implementar la suite de tests que cubre los tres escenarios de acepta
 | TICKET-01 | Refinamiento | Definir campos, tablet y mecanismo de borrador | **2** | Sesión de refinamiento acotada con PM y Tech Lead. El output es un documento de decisiones, no código. Cuatro preguntas concretas con respuestas binarias o de lista corta. Sin incertidumbre técnica, solo de negocio. |
 | TICKET-02 | Base de Datos | Schema `applications` y `candidates` con RLS | **5** | El schema está bien definido en el PRD (sección 9), pero la implementación cubre dos tablas, RLS con política de tenant, tres índices compuestos y dos constraints de unicidad. La combinación de capas (Drizzle ORM + PostgreSQL RLS + migración reversible) sube la estimación de 3 a 5. |
 | TICKET-03 | Backend | `POST /jobs/:jobId/applications` con validación GDPR | **5** | Endpoint público con lógica de negocio compuesta: resolución de `organization_id` desde `job_id`, creación condicional de `Candidate` (upsert por email+org), validación GDPR, generación de `portal_token`, escritura en `AuditLog` con metadata de duración. Múltiples caminos de error documentados (422 × 2 casos, 404). No hay integración externa, pero la lógica transaccional justifica 5. |
-| TICKET-04 | Backend | `PATCH /applications/:id` — auto-save de borrador | **3** | Endpoint de actualización parcial sobre un registro en estado conocido. Lógica simple: verificar `stage = "draft"`, aplicar patch parcial, actualizar `updated_at`. Un solo camino de error (409). Sin integraciones externas. El riesgo principal es el mecanismo de autenticación del candidato anónimo, que depende de TICKET-01. |
+| TICKET-04 | Backend | `PATCH /applications/:id` — auto-save de borrador | **3** | Endpoint de actualización parcial sobre un registro en estado conocido. Lógica: verificar `stage = "draft"` y que el borrador no haya expirado (> 7 días en `updated_at`), aplicar patch parcial, actualizar `updated_at`. Dos caminos de error HTTP 409 distintos (stage incorrecto y borrador expirado). Sin integraciones externas. El riesgo principal es el mecanismo de autenticación del candidato anónimo, que depende de TICKET-01. |
 | TICKET-05 | Backend | `GET /applications/draft` — recuperación de borrador | **3** | Endpoint de solo lectura con tres caminos de respuesta bien definidos (200, 410, 404) y lógica de expiración por `updated_at`. La generación de URL firmada de R2 on-demand añade una integración, pero es la misma utilidad implementada en TICKET-06, que puede reutilizarse. Complejidad baja una vez resuelto TICKET-01. |
 | TICKET-06 | Backend | Upload de CV a R2 y URL firmada | **5** | Integración con Cloudflare R2 vía SDK S3-compatible: multipart/form-data parsing, validación de formato y tamaño (pendiente de TICKET-01), escritura en R2 con ruta estructurada por tenant, actualización de `Candidate.cv_url`, generación de URL firmada con TTL. Es el primer punto de contacto con el servicio externo de storage; la configuración de credenciales y el manejo de errores de R2 añaden incertidumbre que justifica 5 sobre 3. |
 | TICKET-07 | Frontend | Componente de formulario adaptativo mobile/desktop | **8** | El componente más complejo del frontend: layout responsivo para dos breakpoints (con posible tercero según TICKET-01), renderizado condicional de campos según definición de PM, estado del formulario compartido con TICKET-08 y TICKET-09, restricción de Lighthouse Performance > 85 en 3G. La combinación de responsividad estricta, performance y la dependencia de campos aún no definidos sube la estimación a 8. |
